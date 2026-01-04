@@ -256,10 +256,15 @@ impl DataIntegrityValidator {
             ).into());
         }
 
-        // Pattern 2: Common mock keywords
+        // Pattern 2: Software engineering mock indicators (NOT scientific terminology)
+        // ONLY ban words that imply a developer was lazy.
+        // ALLOW words that appear in scientific headers (test, synthetic, generated, model).
         const MOCK_KEYWORDS: &[&str] = &[
-            "mock", "dummy", "test", "fake", "placeholder",
-            "synthetic", "generated", "artificial"
+            "lorem ipsum",
+            "placeholder_data",
+            "mock_protein",
+            "dummy_residue",
+            "todo_remove_this"
         ];
 
         for keyword in MOCK_KEYWORDS {

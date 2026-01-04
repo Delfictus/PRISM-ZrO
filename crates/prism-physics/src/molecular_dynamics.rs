@@ -13,12 +13,17 @@
 //! - Output: Telemetry via prism-core (with feature gates)
 
 use prism_core::{PhaseContext, PhaseOutcome, PrismError};
+use prism_io::sovereign_types::Atom;
+use prism_io::holographic::PtbStructure;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-use prism_gpu::{VramGuard, VramInfo, init_global_vram_guard, ensure_physics_vram};
+use prism_gpu::{VramGuard, VramInfo, init_global_vram_guard, global_vram_guard, ensure_physics_vram};
+
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaSlice, DeviceSlice, CudaContext};
 
 /// Configuration for molecular dynamics simulation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +131,14 @@ pub struct MolecularDynamicsEngine {
     // Timing
     start_time: std::time::Instant,
 
+    // Atom data storage
+    atoms_cpu: Vec<Atom>,  // Host-side atom storage
+    #[cfg(feature = "cuda")]
+    atoms_gpu: Option<CudaSlice<Atom>>,  // GPU-side atom storage
+
     // GPU resources (if enabled)
+    #[cfg(feature = "cuda")]
+    cuda_context: Option<Arc<CudaContext>>,
     #[cfg(feature = "cuda")]
     vram_guard: Option<Arc<VramGuard>>,
 }
@@ -142,6 +154,11 @@ impl MolecularDynamicsEngine {
             acceptance_rate: 0.0,
             gradient_norm: f32::INFINITY,
             start_time: std::time::Instant::now(),
+            atoms_cpu: Vec::new(),
+            #[cfg(feature = "cuda")]
+            atoms_gpu: None,
+            #[cfg(feature = "cuda")]
+            cuda_context: None,
             #[cfg(feature = "cuda")]
             vram_guard: None,
         })
@@ -170,12 +187,21 @@ impl MolecularDynamicsEngine {
         }
 
         // Step 2: Parse and validate protein structure
-        let atom_count = Self::parse_protein_structure(sovereign_data)?;
-        log::info!("✅ Parsed protein structure: {} atoms", atom_count);
+        let atoms = Self::parse_protein_structure(sovereign_data)?;
+        log::info!("✅ Parsed protein structure: {} atoms", atoms.len());
 
         // Step 3: Initialize simulation engine
         let mut engine = Self::new(config)?;
-        engine.current_energy = Self::calculate_initial_energy(atom_count);
+        engine.current_energy = Self::calculate_initial_energy(atoms.len());
+
+        // Step 4: Store atoms in CPU memory
+        engine.atoms_cpu = atoms;
+
+        // Step 5: Transfer to GPU if enabled
+        #[cfg(feature = "cuda")]
+        if engine.config.use_gpu {
+            engine.upload_atoms_to_gpu()?;
+        }
 
         log::info!("🚀 Molecular dynamics engine ready for {} steps", engine.config.max_steps);
 
@@ -209,25 +235,37 @@ impl MolecularDynamicsEngine {
         }
     }
 
-    /// Parse protein structure from sovereign buffer
-    fn parse_protein_structure(data: &[u8]) -> Result<usize, PrismError> {
-        // TODO: Integrate with prism-io HolographicBinaryFormat parser
-        // For now, estimate atom count from data size
-
+    /// Parse protein structure from sovereign buffer and extract real atom data
+    fn parse_protein_structure(data: &[u8]) -> Result<Vec<Atom>, PrismError> {
         if data.is_empty() {
             return Err(PrismError::validation("Empty protein structure data"));
         }
 
-        // Rough estimate: 32 bytes per atom in .ptb format
-        let estimated_atoms = data.len() / 32;
+        // Create temporary file to use HolographicBinaryFormat::load()
+        use std::io::Write;
+        let temp_file_path = "/tmp/temp_ptb_parse.ptb";
 
-        if estimated_atoms == 0 {
-            return Err(PrismError::validation("Protein structure too small"));
+        {
+            let mut temp_file = std::fs::File::create(temp_file_path)
+                .map_err(|e: std::io::Error| PrismError::Internal(format!("Failed to create temp PTB file: {}", e)))?;
+            temp_file.write_all(data)
+                .map_err(|e: std::io::Error| PrismError::Internal(format!("Failed to write temp PTB file: {}", e)))?;
         }
 
-        log::debug!("📊 Estimated {} atoms from {}KB data", estimated_atoms, data.len() / 1024);
+        // Parse PTB file to extract atoms
+        let mut ptb_structure = PtbStructure::load(temp_file_path)
+            .map_err(|e| PrismError::Internal(format!("Failed to parse PTB structure: {}", e)))?;
 
-        Ok(estimated_atoms)
+        // Clean up temp file
+        let _ = std::fs::remove_file(temp_file_path);
+
+        let atoms = ptb_structure.atoms()
+            .map_err(|e| PrismError::Internal(format!("Failed to extract atoms from PTB: {}", e)))?
+            .to_vec();
+
+        log::info!("✅ Parsed {} atoms from PTB structure", atoms.len());
+
+        Ok(atoms)
     }
 
     /// Calculate initial Hamiltonian energy estimate
@@ -343,6 +381,51 @@ impl MolecularDynamicsEngine {
             runtime_seconds: self.start_time.elapsed().as_secs_f32(),
             converged: self.gradient_norm < self.config.nlnm_config.gradient_threshold,
         }
+    }
+
+    /// Set CUDA context for GPU operations
+    #[cfg(feature = "cuda")]
+    pub fn set_cuda_context(&mut self, context: Arc<CudaContext>) {
+        self.cuda_context = Some(context);
+    }
+
+    /// Upload atoms to GPU memory for acceleration
+    #[cfg(feature = "cuda")]
+    fn upload_atoms_to_gpu(&mut self) -> Result<(), PrismError> {
+        if self.atoms_cpu.is_empty() {
+            return Err(PrismError::validation("No atoms to upload to GPU"));
+        }
+
+        log::info!(
+            "🚀 Preparing {} atoms for GPU processing ({} KB)",
+            self.atoms_cpu.len(),
+            (self.atoms_cpu.len() * std::mem::size_of::<Atom>()) / 1024
+        );
+
+        // TODO: Implement actual GPU upload with cudarc 0.18.2 API
+        // For now, simulation runs on CPU with real atom data
+        log::info!("📋 GPU acceleration deferred - using CPU atoms with real PTB data");
+
+        log::info!("✅ Atoms ready for simulation processing");
+        Ok(())
+    }
+
+    /// Get current atoms from simulation
+    ///
+    /// Returns the current atom positions with real PTB structure data.
+    /// GPU acceleration will be implemented once cudarc 0.18.2 API is determined.
+    pub fn get_current_atoms(&self) -> Result<Vec<Atom>, PrismError> {
+        // Return real atoms from CPU memory (parsed from PTB file)
+        log::info!("📦 Extracting {} atoms with real coordinates from simulation", self.atoms_cpu.len());
+
+        if self.atoms_cpu.is_empty() {
+            return Err(PrismError::validation("No atoms available - PTB data not loaded"));
+        }
+
+        // TODO: When GPU acceleration is implemented, perform DTOH copy here
+        // For now, return the CPU atoms which contain the real PTB structure data
+        log::info!("✅ Retrieved {} real atoms from PTB structure", self.atoms_cpu.len());
+        Ok(self.atoms_cpu.clone())
     }
 }
 

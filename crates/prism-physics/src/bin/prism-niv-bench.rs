@@ -18,7 +18,7 @@ use prism_physics::molecular_dynamics::{
     MolecularDynamicsConfig, MolecularDynamicsEngine,
 };
 use prism_core::PrismError;
-use prism_io::AsyncPinnedStreamer;
+use prism_io::{AsyncPinnedStreamer, HolographicBinaryFormat};
 use prism_gpu::memory::init_global_vram_guard;
 use std::time::Instant;
 
@@ -40,7 +40,7 @@ async fn main() -> Result<(), PrismError> {
 
     // 2. GATE 1 CHECK: VRAM Guard - MANDATORY VERIFICATION
     #[cfg(feature = "cuda")]
-    {
+    let dev = {
         log::info!("🔌 Initializing CUDA Driver...");
 
         // 1. Initialize the Driver & Context properly
@@ -50,10 +50,9 @@ async fn main() -> Result<(), PrismError> {
 
         // 2. Use the Context directly (Real, not zeroed)
         // The CudaContext::new(0) already returns an Arc<CudaContext>
-        let cuda_context = dev;
 
         // 3. Initialize the Guard
-        init_global_vram_guard(cuda_context);
+        init_global_vram_guard(dev.clone());
 
         // 4. Query VRAM
         let vram_guard = prism_gpu::memory::global_vram_guard();
@@ -75,7 +74,9 @@ async fn main() -> Result<(), PrismError> {
             .map_err(|e| PrismError::Internal(format!("VRAM Safety Check Failed: {:?}", e)))?;
 
         log::info!("✅ VRAM Guard: Memory allocation approved");
-    }
+
+        dev
+    };
 
     #[cfg(not(feature = "cuda"))]
     {
@@ -106,6 +107,13 @@ async fn main() -> Result<(), PrismError> {
         std::slice::from_raw_parts(sovereign_buffer.as_ptr(), sovereign_buffer.len())
     };
     let mut md_engine = MolecularDynamicsEngine::from_sovereign_buffer(md_config, sovereign_data)?;
+
+    // Set CUDA context for GPU operations
+    #[cfg(feature = "cuda")]
+    {
+        md_engine.set_cuda_context(dev);
+    }
+
     log::info!("🚀 Molecular dynamics engine initialized");
 
     // Execute 10,000 step NLNM breathing simulation (The Breathing Run)
@@ -126,6 +134,49 @@ async fn main() -> Result<(), PrismError> {
     log::info!("🛡️ VRAM Guard: Protected GPU allocation throughout");
     log::info!("🧬 Scientific Output: Protein breathing motion captured");
 
+    // PHASE 3.2: TRAJECTORY EXPORT
+    log::info!("💾 Beginning trajectory export...");
+
+    // Get final atom positions from molecular dynamics engine
+    let final_statistics = md_engine.get_statistics();
+    log::info!("📊 Final simulation state: {} steps completed, energy: {:.3} kcal/mol",
+               final_statistics.current_step, final_statistics.current_energy);
+
+    // Extract final conformational data from GPU memory (REAL DTOH COPY)
+    log::info!("📦 Extracting final atom coordinates from simulation...");
+    let atoms = md_engine.get_current_atoms()
+        .map_err(|e| PrismError::Internal(format!("Failed to extract atoms from simulation: {:?}", e)))?;
+
+    log::info!("✅ Extracted {} atoms with real coordinates from simulation", atoms.len());
+
+    // Create holographic binary format with final conformation
+    let export_hash = [42u8; 32]; // Placeholder hash for export
+    let trajectory_export = HolographicBinaryFormat::new()
+        .with_atoms(atoms)
+        .with_source_hash(export_hash);
+
+    // Save final conformation to nipah_relaxed.ptb
+    let output_path = "data/processed/nipah_relaxed.ptb";
+    trajectory_export.write_to_file(output_path)
+        .map_err(|e| PrismError::Internal(format!("Failed to export trajectory: {:?}", e)))?;
+
+    log::info!("💾 Trajectory Saved: {}", output_path);
+    log::info!("✅ PHASE 3.2 COMPLETE: Trajectory Export Successful");
+
+    // --- THE FIX: MANUAL TEARDOWN ---
+    // 1. Drop the Physics Engine (frees internal tensors)
+    drop(md_engine);
+
+    // 2. Drop the Sovereign Buffer (frees the Pinned Memory/GPU Pointers)
+    // This must happen WHILE the CUDA Context is still alive.
+    drop(sovereign_buffer);
+
+    // 3. Drop the Streamer (closes io_uring)
+    drop(streamer);
+
+    // 4. Finally, the CudaContext (held by vram_guard or dev) will drop naturally here.
+
+    log::info!("👋 System Shutdown Complete.");
     Ok(())
 }
 

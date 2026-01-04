@@ -131,7 +131,16 @@ impl Drop for SovereignBuffer {
         // Secure cleanup - zero the memory before deallocation
         unsafe {
             std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.capacity);
-            // Note: Actual GPU memory deallocation should be handled by CUDA runtime
+
+            // Free pinned host memory using CUDA API
+            #[cfg(feature = "gpu")]
+            {
+                use cudarc::driver::sys::cuMemFreeHost;
+                let result = cuMemFreeHost(self.ptr.as_ptr() as *mut std::ffi::c_void);
+                if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    eprintln!("Warning: Failed to free pinned host memory: {:?}", result);
+                }
+            }
         }
     }
 }

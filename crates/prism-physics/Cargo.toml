@@ -49,7 +49,7 @@ required-features = ["cuda"]
 
 [features]
 default = []
-cuda = ["cudarc", "prism-gpu/cuda"]
+cuda = ["cudarc", "prism-gpu/cuda", "prism-io/gpu"]
 telemetry = ["prism-core/telemetry"]
 
 [dev-dependencies]

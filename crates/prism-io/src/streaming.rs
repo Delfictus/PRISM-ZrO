@@ -13,6 +13,11 @@ use tokio_uring::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use parking_lot::Mutex;
+
+// Logging handled by tracing (already imported elsewhere)
+
+#[cfg(feature = "gpu")]
+use cudarc::driver::CudaContext;
 use futures::stream::{Stream, StreamExt};
 use pin_project::pin_project;
 use std::pin::Pin;
@@ -27,9 +32,9 @@ use crate::{
 
 /// Async pinned streamer for high-performance protein data loading
 pub struct AsyncPinnedStreamer {
-    /// CUDA device for GPU operations (placeholder until API is fixed)
+    /// CUDA context for thread-safe GPU operations
     #[cfg(feature = "gpu")]
-    cuda_device: *mut std::ffi::c_void,
+    device: Arc<CudaContext>,
     /// Data integrity validator
     validator: Arc<DataIntegrityValidator>,
     /// Performance metrics collector
@@ -84,11 +89,9 @@ impl AsyncPinnedStreamer {
         tracing::info!("Initializing AsyncPinnedStreamer with GPU support");
 
         #[cfg(feature = "gpu")]
-        let cuda_device = {
-            // TODO: Fix CUDA device creation once API is resolved
-            tracing::warn!("CUDA device creation temporarily disabled");
-            // Placeholder device handle
-            std::ptr::null_mut()
+        let device = {
+            cudarc::driver::CudaContext::new(0)
+                .map_err(|e| PrismIoError::CudaError(format!("Failed to initialize CUDA context: {:?}", e)))?
         };
 
         let validator = Arc::new(DataIntegrityValidator::new());
@@ -96,7 +99,7 @@ impl AsyncPinnedStreamer {
 
         Ok(Self {
             #[cfg(feature = "gpu")]
-            cuda_device,
+            device,
             validator,
             metrics,
         })
@@ -162,11 +165,8 @@ impl AsyncPinnedStreamer {
         // Verify integrity
         structure.verify_integrity()?;
 
-        // Convert to verified protein data
-        let verified_data = structure.to_verified_protein_data()?;
-
-        // Transfer to GPU memory
-        self.transfer_to_gpu_memory(verified_data).await
+        // Transfer the original PTB file data (preserving magic bytes)
+        self.transfer_ptb_file_data(structure).await
     }
 
     /// Load a .pdb file using async streaming and warp-drive parsing
@@ -251,7 +251,7 @@ impl AsyncPinnedStreamer {
         let start_time = std::time::Instant::now();
 
         // Initialize warp parser
-        let parser = WarpDriveParser::new(self.cuda_device)?;
+        let parser = WarpDriveParser::new(std::ptr::null_mut())?;
 
         // Parse using GPU acceleration
         let parsed_data = parser.parse_pdb_parallel(pdb_data).await?;
@@ -351,6 +351,70 @@ impl AsyncPinnedStreamer {
         })
     }
 
+    /// Transfer PTB file data to pinned host memory preserving format
+    async fn transfer_ptb_file_data(&self, structure: crate::holographic::PtbStructure) -> Result<SovereignBuffer> {
+        #[cfg(feature = "gpu")]
+        {
+            // Access the raw PTB file data from memory map
+            let file_data = structure.as_bytes();
+            let data_size = file_data.len();
+
+            tracing::info!("📦 Transferring PTB file data: {} bytes (preserving magic bytes)", data_size);
+
+            // Allocate PINNED HOST MEMORY for the complete PTB file
+            let host_ptr = {
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    let result = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, data_size);
+                    if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        return Err(PrismIoError::CudaError(format!("Pinned host memory allocation failed: {:?}", result)));
+                    }
+                }
+                ptr as *mut u8
+            };
+
+            // Copy complete PTB file data to pinned host memory
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    file_data.as_ptr(),
+                    host_ptr,
+                    data_size
+                );
+            }
+
+            tracing::info!("✅ PTB file data copied to pinned host memory");
+
+            // DEBUG: Log the first 8 bytes to verify magic bytes
+            unsafe {
+                let magic_slice = std::slice::from_raw_parts(host_ptr, 8.min(data_size));
+                tracing::info!("🔍 First 8 bytes in pinned memory: {:?}", magic_slice);
+                if magic_slice.len() >= 7 {
+                    let magic_str = std::str::from_utf8(&magic_slice[0..7]).unwrap_or("invalid");
+                    tracing::info!("🔍 Magic bytes as string: '{}'", magic_str);
+                }
+            }
+
+            // Create source hash from PTB structure
+            let integrity_hash = structure.source_hash();
+
+            // Create SovereignBuffer with PTB file data
+            Ok(unsafe {
+                SovereignBuffer::new_from_dma(
+                    std::ptr::NonNull::new(host_ptr)
+                        .ok_or_else(|| PrismIoError::CudaError("Invalid host pointer".to_string()))?,
+                    data_size,
+                    data_size,
+                    integrity_hash,
+                )
+            })
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        {
+            Err(PrismIoError::CudaError("GPU features required for SovereignBuffer".to_string()))
+        }
+    }
+
     /// Transfer verified protein data to GPU memory as SovereignBuffer
     async fn transfer_to_gpu_memory(
         &self,
@@ -375,8 +439,31 @@ impl AsyncPinnedStreamer {
             //     ).map_err(|e| PrismIoError::CudaError(format!("GPU copy failed: {:?}", e)))?;
             // }
 
-            // Placeholder GPU pointer for now (will be properly allocated when CUDA API is fixed)
-            let gpu_ptr: *mut u8 = std::ptr::null_mut();
+            // Allocate PINNED HOST MEMORY (not device memory) for CPU+GPU access
+            #[cfg(feature = "gpu")]
+            let host_ptr = {
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    let result = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, data_size);
+                    if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        return Err(PrismIoError::CudaError(format!("Pinned host memory allocation failed: {:?}", result)));
+                    }
+                }
+                ptr as *mut u8
+            };
+
+            // Copy atom data to pinned host memory
+            #[cfg(feature = "gpu")]
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    atoms.as_ptr() as *const u8,
+                    host_ptr,
+                    data_size
+                );
+            }
+
+            #[cfg(not(feature = "gpu"))]
+            let host_ptr: *mut u8 = std::ptr::null_mut();
 
             // Create SovereignBuffer
             let integrity_hash_slice = verified_data.source_identifier().as_bytes();
@@ -384,10 +471,12 @@ impl AsyncPinnedStreamer {
             let copy_len = std::cmp::min(integrity_hash_slice.len(), 32);
             hash_array[..copy_len].copy_from_slice(&integrity_hash_slice[..copy_len]);
 
+            // CRITICAL: Pinned host memory allocated - SovereignBuffer will manage lifecycle
+
             Ok(unsafe {
                 SovereignBuffer::new_from_dma(
-                    std::ptr::NonNull::new(gpu_ptr)
-                        .ok_or_else(|| PrismIoError::CudaError("Invalid GPU pointer".to_string()))?,
+                    std::ptr::NonNull::new(host_ptr)
+                        .ok_or_else(|| PrismIoError::CudaError("Invalid host pointer".to_string()))?,
                     data_size,
                     data_size,
                     hash_array,
