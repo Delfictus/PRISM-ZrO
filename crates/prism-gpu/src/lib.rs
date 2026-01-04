@@ -1,0 +1,54 @@
+//! # prism-gpu
+//!
+//! GPU acceleration layer for PRISM v2.
+//! Optimized for PRISM-VE Benchmark.
+
+pub mod context;
+pub mod global_context;
+pub mod feature_merge;
+pub mod dendritic_reservoir;
+pub mod mega_fused;
+pub mod mega_fused_batch;
+pub mod reservoir_construction;
+pub mod ve_swarm;
+pub mod polycentric_immunity;
+pub mod active_inference; 
+
+// Essential exports
+pub use context::{GpuContext, GpuInfo, GpuSecurityConfig};
+pub use global_context::{GlobalGpuContext, GlobalGpuError};
+pub use feature_merge::{FeatureMergeGpu, FeatureMergeConfig, FeatureMergeResult};
+pub use dendritic_reservoir::DendriticReservoirGpu;
+pub use mega_fused::{MegaFusedGpu, MegaFusedConfig, MegaFusedMode, MegaFusedOutput, MegaFusedParams, GpuProvenanceData, KernelTelemetryEvent, GpuTelemetry, confidence, signals};
+pub use mega_fused_batch::{MegaFusedBatchGpu, BatchStructureDesc, StructureInput, StructureMetadata, PkParams, ImmunityMetadataV2, CountryImmunityTimeSeriesV2, PackedBatch, BatchStructureOutput, BatchOutput, TrainingOutput};
+pub use reservoir_construction::{BioReservoir, SparseConnection, compute_readout_weights};
+pub use polycentric_immunity::{PolycentricImmunityGpu, N_EPITOPE_CENTERS, N_PK_SCENARIOS, POLYCENTRIC_OUTPUT_DIM, DEFAULT_CROSS_REACTIVITY};
+pub use active_inference::{ActiveInferenceGpu, ActiveInferencePolicy};
+
+// Commented out unused modules to isolate benchmark requirements
+// pub mod aatgs;
+// pub mod aatgs_integration;
+// pub mod cma;
+// pub mod cma_es;
+// pub mod cryptic_gpu;
+// pub mod glycan_gpu;
+// pub mod dendritic_whcr;
+// pub mod floyd_warshall;
+// pub mod lbs;
+// pub mod readout_training;
+// pub mod molecular;
+// pub mod multi_device_pool;
+// pub mod multi_gpu;
+// pub mod multi_gpu_integration;
+// pub mod pimc;
+// pub mod quantum;
+pub mod stream_integration;
+pub mod stream_manager;
+// pub mod tda;
+// pub mod thermodynamic;
+// pub mod transfer_entropy;
+// pub mod ultra_kernel;
+// pub mod whcr;
+// pub mod batch_tda;
+// pub mod mega_fused_integrated;
+// pub mod training;

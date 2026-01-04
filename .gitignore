@@ -1,0 +1,9 @@
+# Large binary dependencies
+crates/prism-niv-bench/tools/libtorch.zip
+crates/prism-niv-bench/tools/libtorch/
+*.so
+*.so.*
+*.a
+target/
+.env
+/data/
