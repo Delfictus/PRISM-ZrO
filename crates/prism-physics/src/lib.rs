@@ -16,6 +16,9 @@ pub mod dynamics;
 pub mod fields;
 pub mod materials;
 
+// Molecular Dynamics - PIMC/NLNM Solvers for protein structures
+pub mod molecular_dynamics;
+
 /// CMA-ES (Covariance Matrix Adaptation Evolution Strategy) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CmaEsConfig {
@@ -149,7 +152,7 @@ impl CmaEsPhaseController {
         if let Some((min_idx, &min_fitness)) = fitness_values
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         {
             if min_fitness < self.best_fitness {
                 self.best_fitness = min_fitness;
@@ -296,12 +299,14 @@ impl PhaseController for CmaEsPhaseController {
             // Perform one CMA-ES step
             self.optimizer
                 .as_mut()
-                .unwrap()
+                .ok_or_else(|| PrismError::Internal("CMA-ES optimizer not initialized".to_string()))?
                 .step(fitness_fn)
                 .map_err(|e| PrismError::Internal(e.to_string()))?;
 
             // Get current state
-            let state = self.optimizer.as_ref().unwrap().get_state();
+            let state = self.optimizer.as_ref()
+                .ok_or_else(|| PrismError::Internal("CMA-ES optimizer not initialized".to_string()))?
+                .get_state();
 
             // Update our tracking
             self.best_fitness = state.best_fitness;
@@ -340,7 +345,9 @@ impl PhaseController for CmaEsPhaseController {
         }
 
         // Get final state from optimizer
-        let cpu_state = self.optimizer.as_ref().unwrap().get_state();
+        let cpu_state = self.optimizer.as_ref()
+            .ok_or_else(|| PrismError::Internal("CMA-ES optimizer not initialized".to_string()))?
+            .get_state();
 
         // Convert cma_cpu::CmaState to prism_core::CmaState
         let cma_state = prism_core::CmaState {
@@ -484,7 +491,7 @@ mod tests {
         let mut context = PhaseContext::new();
 
         // Execute optimization
-        let outcome = controller.execute(&graph, &mut context).unwrap();
+        let outcome = controller.execute(&graph, &mut context).expect("Test execution should succeed");
         assert!(outcome.is_success());
 
         // Verify CMA state was created

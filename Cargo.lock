@@ -3819,12 +3819,14 @@ dependencies = [
  "bincode",
  "criterion",
  "cudarc 0.18.2",
+ "env_logger 0.11.8",
  "log",
  "nalgebra 0.32.6",
  "ndarray 0.15.6",
  "num-complex",
  "prism-core",
  "prism-gpu",
+ "prism-io",
  "rand 0.8.5",
  "rand_distr",
  "rayon",
@@ -3833,6 +3835,7 @@ dependencies = [
  "serde_json",
  "statrs",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

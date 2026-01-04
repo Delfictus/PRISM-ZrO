@@ -120,6 +120,7 @@ hex = "0.4"
 # Inter-crate dependencies (using new paths)
 prism-core = { path = "crates/prism-core" }
 prism-gpu = { path = "crates/prism-gpu" }
+prism-io = { path = "crates/prism-io" }
 prism-geometry = { path = "crates/prism-geometry" }
 prism-fluxnet = { path = "crates/prism-fluxnet" }
 prism-phases = { path = "crates/prism-phases" }

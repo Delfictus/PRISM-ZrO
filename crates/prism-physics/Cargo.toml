@@ -10,11 +10,13 @@ repository.workspace = true
 # Core dependencies
 prism-core = { workspace = true }
 prism-gpu = { workspace = true, optional = true }
+prism-io = { workspace = true }
 
 # Async & error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -35,13 +37,20 @@ rayon = { workspace = true }
 
 # Logging
 log = { workspace = true }
+env_logger = "0.11"
 
 # GPU
 cudarc = { workspace = true, optional = true }
 
+[[bin]]
+name = "prism-niv-bench"
+path = "src/bin/prism-niv-bench.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 cuda = ["cudarc", "prism-gpu/cuda"]
+telemetry = ["prism-core/telemetry"]
 
 [dev-dependencies]
 approx = "0.5"

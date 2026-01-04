@@ -24,6 +24,7 @@ pub use mega_fused_batch::{MegaFusedBatchGpu, BatchStructureDesc, StructureInput
 pub use reservoir_construction::{BioReservoir, SparseConnection, compute_readout_weights};
 pub use polycentric_immunity::{PolycentricImmunityGpu, N_EPITOPE_CENTERS, N_PK_SCENARIOS, POLYCENTRIC_OUTPUT_DIM, DEFAULT_CROSS_REACTIVITY};
 pub use active_inference::{ActiveInferenceGpu, ActiveInferencePolicy};
+pub use memory::{VramGuard, VramInfo, VramGuardError, init_global_vram_guard, global_vram_guard};
 
 // Commented out unused modules to isolate benchmark requirements
 // pub mod aatgs;
@@ -44,6 +45,9 @@ pub use active_inference::{ActiveInferenceGpu, ActiveInferencePolicy};
 // pub mod quantum;
 pub mod stream_integration;
 pub mod stream_manager;
+
+// VRAM Safety Guard - Battle-tested memory management
+pub mod memory;
 // pub mod tda;
 // pub mod thermodynamic;
 // pub mod transfer_entropy;
