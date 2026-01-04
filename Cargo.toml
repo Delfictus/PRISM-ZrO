@@ -31,12 +31,12 @@ members = [
     "crates/prism-escape-extract",  # Real feature extraction for viral escape benchmark
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # Foundation Crates (Production-grade GPU Implementations)
+    # Foundation Crates (Production-grade GPU Implementations) - DISABLED: missing dirs
     # ═══════════════════════════════════════════════════════════════════════════
-    "foundation/shared-types",
-    "foundation/prct-core",
-    "foundation/quantum",
-    "foundation/neuromorphic",
+    # "foundation/shared-types",
+    # "foundation/prct-core",
+    # "foundation/quantum",
+    # "foundation/neuromorphic",
 ]
 
 # Default package for `cargo run` - the unified TUI
@@ -129,8 +129,8 @@ prism-mec = { path = "crates/prism-mec" }
 prism-physics = { path = "crates/prism-physics" }
 prism-gnn = { path = "crates/prism-gnn" }
 prism-lbs = { path = "crates/prism-lbs" }
-shared-types = { path = "foundation/shared-types" }
-prct-core = { path = "foundation/prct-core" }
+# shared-types = { path = "foundation/shared-types" }  # DISABLED: missing dir
+# prct-core = { path = "foundation/prct-core" }  # DISABLED: missing dir
 
 [profile.release]
 opt-level = 3

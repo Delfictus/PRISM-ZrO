@@ -30,6 +30,7 @@ pub mod glycan_dynamics;
 pub mod nipah_platform_validation;
 pub mod pimc_epitope_optimization;
 pub mod qubo_tda_integration;
+pub mod conservation_analysis;
 // pub mod gpu_parallel;  // DISABLED: needs vendored types
 // pub mod vendored;  // DISABLED: Use prism-gpu directly
 // pub mod gpu_graph_pipeline;
