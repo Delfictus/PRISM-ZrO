@@ -111,7 +111,9 @@ async fn main() -> Result<(), PrismError> {
     // Set CUDA context for GPU operations
     #[cfg(feature = "cuda")]
     {
-        md_engine.set_cuda_context(dev);
+        // TODO: Enable when GPU kernels are actually implemented
+        // md_engine.set_cuda_context(dev);
+        log::info!("🔧 GPU kernels not yet implemented, skipping CUDA context setup");
     }
 
     log::info!("🚀 Molecular dynamics engine initialized");
