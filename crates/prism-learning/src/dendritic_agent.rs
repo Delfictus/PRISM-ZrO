@@ -238,6 +238,18 @@ impl RLSReadout {
         let w = &mut self.w_active[output_idx];
         let p = &mut self.p_matrices[output_idx];
 
+        // Skip update if state contains NaN/Inf
+        if state.iter().any(|x| !x.is_finite()) {
+            log::warn!("⚠️ RLS: Skipping update due to non-finite state values");
+            return;
+        }
+
+        // Skip if target is NaN/Inf
+        if !target.is_finite() {
+            log::warn!("⚠️ RLS: Skipping update due to non-finite target");
+            return;
+        }
+
         // Clamp reward modulation to safe range
         let modulation = reward_modulation.max(MIN_REWARD_MODULATION).min(MAX_REWARD_MODULATION);
 
@@ -256,10 +268,12 @@ impl RLSReadout {
             .sum();
 
         // Step 3: Compute Kalman gain k = P @ x / (λ + x^T @ P @ x)
-        let denom = self.lambda + xtpx;
+        let denom = (self.lambda + xtpx).max(1e-8);  // Prevent division by zero
         let mut k = vec![0.0f32; n];
         for i in 0..n {
             k[i] = px[i] / denom;
+            // Clamp Kalman gain to prevent explosions
+            k[i] = k[i].clamp(-1e6, 1e6);
         }
 
         // Step 4: Compute prediction error
@@ -271,8 +285,12 @@ impl RLSReadout {
 
         // Step 5: Update weights with REWARD MODULATION
         // w = w + modulation * error * k
+        // Clamp error to prevent explosive updates
+        let clamped_error = error.clamp(-100.0, 100.0);
         for i in 0..n {
-            w[i] += modulation * error * k[i];
+            w[i] += modulation * clamped_error * k[i];
+            // Clamp weights to prevent overflow
+            w[i] = w[i].clamp(-1e4, 1e4);
         }
 
         // Step 6: Update P matrix: P = (1/λ) * (P - k @ x^T @ P)
@@ -283,12 +301,14 @@ impl RLSReadout {
             for j in 0..n {
                 let delta = p_modulation * k[i] * px[j];
                 p[i * n + j] = inv_lambda * (p[i * n + j] - delta);
+                // Clamp P matrix elements
+                p[i * n + j] = p[i * n + j].clamp(-1e8, 1e8);
             }
         }
 
-        // Step 7: Regularization - ensure P doesn't grow unbounded
+        // Step 7: Regularization - ensure P diagonal doesn't collapse or explode
         for i in 0..n {
-            p[i * n + i] = p[i * n + i].max(1e-6);
+            p[i * n + i] = p[i * n + i].clamp(1e-6, 1e6);
         }
     }
 
@@ -352,6 +372,8 @@ pub struct DendriticAgent {
     step_count: u64,
     /// Last reservoir state (cached for training)
     last_state: Option<Vec<f32>>,
+    /// Learning rate multiplier (HIL control)
+    learning_rate_multiplier: f32,
 }
 
 impl DendriticAgent {
@@ -407,6 +429,7 @@ impl DendriticAgent {
             epsilon: config.epsilon_start,
             step_count: 0,
             last_state: None,
+            learning_rate_multiplier: 1.0,
         })
     }
 
@@ -452,19 +475,45 @@ impl DendriticAgent {
         // Compute Q-values using active weights
         let q_values = self.readout.compute_q_values(&state, false);
 
-        // Select best action from each head
+        // Check for NaN in Q-values (indicates numerical instability)
+        let nan_count = q_values.iter().filter(|x| x.is_nan()).count();
+        if nan_count > 0 {
+            log::warn!("⚠️ NaN detected in Q-values: {}/{} values are NaN. Falling back to random action.",
+                       nan_count, q_values.len());
+            // Return random action when Q-values are corrupted
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            return FactorizedAction::new(
+                rng.gen_range(0..BINS_PER_PARAM),
+                rng.gen_range(0..BINS_PER_PARAM),
+                rng.gen_range(0..BINS_PER_PARAM),
+                rng.gen_range(0..BINS_PER_PARAM),
+            );
+        }
+
+        // Select best action from each head (handle NaN gracefully)
+        let safe_cmp = |a: f32, b: f32| -> std::cmp::Ordering {
+            // Treat NaN as less than any real number
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        };
+
         let temp_idx = (0..BINS_PER_PARAM)
-            .max_by(|&a, &b| q_values[a].partial_cmp(&q_values[b]).unwrap())
-            .unwrap();
+            .max_by(|&a, &b| safe_cmp(q_values[a], q_values[b]))
+            .unwrap_or(0);
         let fric_idx = (0..BINS_PER_PARAM)
-            .max_by(|&a, &b| q_values[BINS_PER_PARAM + a].partial_cmp(&q_values[BINS_PER_PARAM + b]).unwrap())
-            .unwrap();
+            .max_by(|&a, &b| safe_cmp(q_values[BINS_PER_PARAM + a], q_values[BINS_PER_PARAM + b]))
+            .unwrap_or(0);
         let spring_idx = (0..BINS_PER_PARAM)
-            .max_by(|&a, &b| q_values[2*BINS_PER_PARAM + a].partial_cmp(&q_values[2*BINS_PER_PARAM + b]).unwrap())
-            .unwrap();
+            .max_by(|&a, &b| safe_cmp(q_values[2*BINS_PER_PARAM + a], q_values[2*BINS_PER_PARAM + b]))
+            .unwrap_or(0);
         let bias_idx = (0..BINS_PER_PARAM)
-            .max_by(|&a, &b| q_values[3*BINS_PER_PARAM + a].partial_cmp(&q_values[3*BINS_PER_PARAM + b]).unwrap())
-            .unwrap();
+            .max_by(|&a, &b| safe_cmp(q_values[3*BINS_PER_PARAM + a], q_values[3*BINS_PER_PARAM + b]))
+            .unwrap_or(0);
 
         FactorizedAction::new(temp_idx, fric_idx, spring_idx, bias_idx)
     }
@@ -523,8 +572,10 @@ impl DendriticAgent {
 
             // ================================================================
             // REWARD-MODULATED PLASTICITY: Scale learning by reward magnitude
+            // Apply learning rate multiplier (HIL control)
             // ================================================================
-            let reward_modulation = RLSReadout::compute_reward_modulation(reward);
+            let base_modulation = RLSReadout::compute_reward_modulation(reward);
+            let reward_modulation = base_modulation * self.learning_rate_multiplier;
 
             // For each head, compute max Q and update with modulation
             for head in 0..NUM_PARAMS {
@@ -585,6 +636,17 @@ impl DendriticAgent {
 
     pub fn get_step_count(&self) -> u64 {
         self.step_count
+    }
+
+    /// Set learning rate multiplier (HIL control)
+    /// Values > 1.0 speed up learning, < 1.0 slow it down
+    pub fn set_learning_rate_multiplier(&mut self, multiplier: f32) {
+        self.learning_rate_multiplier = multiplier.clamp(0.1, 10.0);
+        log::info!("📈 Learning rate multiplier set to {:.2}x", self.learning_rate_multiplier);
+    }
+
+    pub fn get_learning_rate_multiplier(&self) -> f32 {
+        self.learning_rate_multiplier
     }
 
     pub fn eval_mode(&mut self) {

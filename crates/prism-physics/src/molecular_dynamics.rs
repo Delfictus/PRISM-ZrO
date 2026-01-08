@@ -375,21 +375,124 @@ impl MolecularDynamicsEngine {
 
     fn parse_protein_structure(data: &[u8]) -> Result<Vec<Atom>, PrismError> {
         if data.is_empty() { return Err(PrismError::validation("Empty data")); }
+
+        // Detect format by magic bytes
+        // PTB format: "PRISM4D\0" = [80, 82, 73, 83, 77, 52, 68, 0]
+        // PDB format: typically starts with "HEADER", "ATOM", "REMARK", etc.
+        const PTB_MAGIC: &[u8] = b"PRISM4D\0";
+
+        if data.len() >= 8 && &data[0..8] == PTB_MAGIC {
+            // PTB binary format - use existing parser
+            log::debug!("Detected PTB format, using binary parser");
+            Self::parse_ptb_structure(data)
+        } else {
+            // Assume PDB text format
+            log::info!("Detected PDB format, parsing text structure");
+            Self::parse_pdb_structure(data)
+        }
+    }
+
+    /// Parse PTB (PRISM binary) format
+    fn parse_ptb_structure(data: &[u8]) -> Result<Vec<Atom>, PrismError> {
         use std::io::Write;
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let temp_path = format!("/tmp/prism_holographic_{}.ptb", timestamp);
-        
+
         // RAII Guard ensures file is deleted when this scope ends
         let _guard = TempFileGuard { path: temp_path.clone() };
-        
+
         {
             let mut f = std::fs::File::create(&temp_path).map_err(|e| PrismError::Internal(e.to_string()))?;
             f.write_all(data).map_err(|e| PrismError::Internal(e.to_string()))?;
         }
-        
+
         let mut structure = PtbStructure::load(&temp_path).map_err(|e| PrismError::Internal(e.to_string()))?;
         let atoms = structure.atoms().map_err(|e| PrismError::Internal(e.to_string()))?.to_vec();
-        
+
+        Ok(atoms)
+    }
+
+    /// Parse PDB text format directly
+    fn parse_pdb_structure(data: &[u8]) -> Result<Vec<Atom>, PrismError> {
+        let content = String::from_utf8_lossy(data);
+        let mut atoms = Vec::new();
+
+        for line in content.lines() {
+            if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
+                if line.len() < 54 { continue; } // Skip malformed lines
+
+                // Extract coordinates (columns 31-54, 1-indexed in PDB spec)
+                let x: f32 = line.get(30..38).unwrap_or("0.0").trim().parse().unwrap_or(0.0);
+                let y: f32 = line.get(38..46).unwrap_or("0.0").trim().parse().unwrap_or(0.0);
+                let z: f32 = line.get(46..54).unwrap_or("0.0").trim().parse().unwrap_or(0.0);
+
+                // Extract element (columns 77-78) or infer from atom name
+                let element_char = line.get(76..78)
+                    .unwrap_or("  ")
+                    .trim()
+                    .chars()
+                    .next()
+                    .unwrap_or_else(|| {
+                        // Fallback: infer from atom name (columns 13-16)
+                        line.get(12..16)
+                            .unwrap_or("C")
+                            .trim()
+                            .chars()
+                            .next()
+                            .unwrap_or('C')
+                    });
+
+                // Map element to atomic number
+                let atomic_number = match element_char {
+                    'C' => 6,
+                    'N' => 7,
+                    'O' => 8,
+                    'S' => 16,
+                    'P' => 15,
+                    'H' => 1,
+                    'F' => 9,
+                    'K' => 19,
+                    'Z' => 30, // Zinc
+                    'M' => 12, // Magnesium (Mg)
+                    'I' => 53, // Iodine
+                    _ => 6,    // Default to carbon
+                };
+
+                // Extract residue ID (columns 23-26)
+                let residue_id: u16 = line.get(22..26)
+                    .unwrap_or("0")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+
+                // VdW radius lookup
+                let radius = match atomic_number {
+                    1 => 1.20,  // H
+                    6 => 1.70,  // C
+                    7 => 1.55,  // N
+                    8 => 1.52,  // O
+                    15 => 1.80, // P
+                    16 => 1.80, // S
+                    _ => 1.70,  // Default
+                };
+
+                atoms.push(Atom {
+                    coords: [x, y, z],
+                    element: atomic_number,
+                    residue_id,
+                    atom_type: 1,
+                    charge: 0.0,
+                    radius,
+                    _reserved: [0; 4],
+                });
+            }
+        }
+
+        if atoms.is_empty() {
+            return Err(PrismError::validation("No ATOM records found in PDB data"));
+        }
+
+        log::info!("Parsed {} atoms from PDB format", atoms.len());
         Ok(atoms)
     }
     

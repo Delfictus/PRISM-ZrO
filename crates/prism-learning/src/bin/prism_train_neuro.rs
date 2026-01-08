@@ -12,13 +12,26 @@
 //! Recommended Config (vs DQN):
 //! - DQN: 10 chunks × 100K steps = 1M total
 //! - Dendritic: 100 chunks × 10K steps = 1M total (more learning signal)
+//!
+//! ## Human-in-the-Loop (HIL) Live Control
+//!
+//! The trainer watches `{output}/hil_control.json` for runtime commands:
+//! - `spike_exploration`: Temporarily boost epsilon to 0.8
+//! - `save_checkpoint`: Force immediate checkpoint save
+//! - `set_epsilon`: Set epsilon to custom value (0.0-1.0)
+//! - `pause`: Pause after current episode
+//! - `resume`: Resume training
+//!
+//! Status is written to `{output}/hil_status.json` every episode.
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{info, warn, debug};
+use log::{info, warn};
 use std::path::Path;
 use std::time::Instant;
 use std::fs;
+use serde::{Serialize, Deserialize};
+use chrono::Utc;
 
 use prism_learning::{
     CalibrationManifest,
@@ -89,7 +102,7 @@ struct Args {
 }
 
 /// Training statistics
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Serialize)]
 struct TrainingStats {
     targets_completed: usize,
     total_episodes: usize,
@@ -97,6 +110,212 @@ struct TrainingStats {
     total_transitions: usize,
     best_reward: f32,
     sum_best_rewards: f32,
+}
+
+// ============================================================================
+// HIL (Human-in-the-Loop) Control System
+// ============================================================================
+
+/// HIL Control Commands (read from hil_control.json)
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct HilControl {
+    /// Spike exploration to 0.8 for next N episodes
+    #[serde(default)]
+    spike_exploration: usize,
+    /// Set epsilon to custom value
+    #[serde(default)]
+    set_epsilon: Option<f32>,
+    /// Learning rate multiplier (1.0 = default, >1 = faster learning, <1 = slower)
+    #[serde(default)]
+    learning_rate_multiplier: Option<f32>,
+    /// Force checkpoint save
+    #[serde(default)]
+    save_checkpoint: bool,
+    /// Pause training after current episode
+    #[serde(default)]
+    pause: bool,
+    /// Command acknowledged flag (trainer sets this after processing)
+    #[serde(default)]
+    ack: u64,
+}
+
+/// HIL Status (written to hil_status.json every episode)
+#[derive(Debug, Serialize)]
+struct HilStatus {
+    /// Current target name
+    current_target: String,
+    /// Current target family
+    current_family: String,
+    /// Current target index (1-indexed)
+    target_idx: usize,
+    /// Total targets
+    total_targets: usize,
+    /// Current episode (0-indexed)
+    episode: usize,
+    /// Max episodes per target
+    max_episodes: usize,
+    /// Current epsilon
+    epsilon: f64,
+    /// Current episode reward
+    episode_reward: f32,
+    /// Best reward for this target
+    best_reward: f32,
+    /// Episodes without improvement
+    episodes_without_improvement: usize,
+    /// Patience threshold
+    patience: usize,
+    /// RLS error from last training
+    rls_error: f32,
+    /// Episode duration in seconds
+    episode_time_secs: f32,
+    /// Total training time in seconds
+    total_time_secs: f32,
+    /// Estimated time remaining in seconds
+    eta_secs: f32,
+    /// Is paused
+    paused: bool,
+    /// Current learning rate multiplier
+    learning_rate_multiplier: f32,
+    /// Training stats
+    stats: TrainingStats,
+    /// Learning monitor - detailed live stats
+    learning_monitor: LearningMonitor,
+    /// Timestamp
+    timestamp: String,
+}
+
+/// Detailed learning statistics for live monitoring
+#[derive(Debug, Serialize, Default, Clone)]
+struct LearningMonitor {
+    /// Recent reward trend (last 10 episodes), positive = improving
+    reward_trend: f32,
+    /// RLS error trend (last 10 episodes), negative = improving
+    error_trend: f32,
+    /// Per-family performance summary
+    family_performance: std::collections::HashMap<String, FamilyStats>,
+    /// Rolling average of episode times
+    avg_episode_time: f32,
+    /// Recent rewards buffer for trend calculation
+    recent_rewards: Vec<f32>,
+    /// Recent errors buffer for trend calculation
+    recent_errors: Vec<f32>,
+    /// Current training mode (interleaved vs sequential)
+    training_mode: String,
+    /// Current family round (for interleaved mode)
+    interleave_round: usize,
+    /// Families in current round
+    families_in_round: Vec<String>,
+}
+
+/// Per-family statistics
+#[derive(Debug, Serialize, Default, Clone)]
+struct FamilyStats {
+    /// Number of targets in this family
+    targets_count: usize,
+    /// Targets completed
+    targets_completed: usize,
+    /// Sum of best rewards
+    sum_best_rewards: f32,
+    /// Average best reward
+    avg_best_reward: f32,
+    /// Total episodes trained
+    total_episodes: usize,
+}
+
+/// Read HIL control file if it exists
+fn read_hil_control(output_dir: &str) -> HilControl {
+    let control_path = format!("{}/hil_control.json", output_dir);
+    if let Ok(content) = fs::read_to_string(&control_path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        HilControl::default()
+    }
+}
+
+/// Write HIL status file
+fn write_hil_status(output_dir: &str, status: &HilStatus) {
+    let status_path = format!("{}/hil_status.json", output_dir);
+    if let Ok(json) = serde_json::to_string_pretty(status) {
+        let _ = fs::write(&status_path, json);
+    }
+}
+
+/// Acknowledge HIL control command
+fn ack_hil_control(output_dir: &str, ack_id: u64) {
+    let control_path = format!("{}/hil_control.json", output_dir);
+    let control = HilControl { ack: ack_id, ..Default::default() };
+    if let Ok(json) = serde_json::to_string_pretty(&control) {
+        let _ = fs::write(&control_path, json);
+    }
+}
+
+/// Create initial HIL control file template
+fn create_hil_control_template(output_dir: &str) {
+    let control_path = format!("{}/hil_control.json", output_dir);
+    let template = r#"{
+  "spike_exploration": 0,
+  "set_epsilon": null,
+  "learning_rate_multiplier": null,
+  "save_checkpoint": false,
+  "pause": false,
+  "ack": 0
+}
+"#;
+    let _ = fs::write(&control_path, template);
+    info!("📡 HIL control file created: {}", control_path);
+    info!("   Edit this file to control training in real-time!");
+    info!("   Commands:");
+    info!("     spike_exploration: N   → Boost epsilon to 0.8 for N episodes");
+    info!("     set_epsilon: 0.5       → Set epsilon to specific value");
+    info!("     learning_rate_multiplier: 2.0 → Speed up learning (or <1 to slow)");
+    info!("     save_checkpoint: true  → Force immediate checkpoint save");
+    info!("     pause: true            → Pause training");
+}
+
+/// Calculate trend from recent values (positive = increasing)
+fn calculate_trend(values: &[f32]) -> f32 {
+    if values.len() < 3 {
+        return 0.0;
+    }
+    let n = values.len();
+    let half = n / 2;
+    let first_half: f32 = values[..half].iter().sum::<f32>() / half as f32;
+    let second_half: f32 = values[half..].iter().sum::<f32>() / (n - half) as f32;
+    second_half - first_half
+}
+
+/// Interleave targets by family in round-robin fashion
+/// This creates a "zipper" pattern: family1_t1, family2_t1, family3_t1, family1_t2, ...
+fn interleave_targets_by_family(targets: &[prism_learning::ProteinTarget]) -> Vec<usize> {
+    use std::collections::HashMap;
+
+    // Group target indices by family
+    let mut family_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, target) in targets.iter().enumerate() {
+        family_indices.entry(target.family.clone())
+            .or_default()
+            .push(idx);
+    }
+
+    // Get sorted family names for consistent ordering
+    let mut family_names: Vec<_> = family_indices.keys().cloned().collect();
+    family_names.sort();
+
+    // Create interleaved order
+    let mut interleaved: Vec<usize> = Vec::with_capacity(targets.len());
+    let max_family_size = family_indices.values().map(|v| v.len()).max().unwrap_or(0);
+
+    for round in 0..max_family_size {
+        for family in &family_names {
+            if let Some(indices) = family_indices.get(family) {
+                if round < indices.len() {
+                    interleaved.push(indices[round]);
+                }
+            }
+        }
+    }
+
+    interleaved
 }
 
 fn main() -> Result<()> {
@@ -125,6 +344,9 @@ fn main() -> Result<()> {
     // Create output directory
     std::fs::create_dir_all(&args.output)
         .with_context(|| format!("Failed to create output directory: {}", args.output))?;
+
+    // Initialize HIL control system
+    create_hil_control_template(&args.output);
 
     // Load manifest
     info!("📋 Loading manifest: {}", args.manifest);
@@ -162,11 +384,57 @@ fn main() -> Result<()> {
     // Training loop
     let mut stats = TrainingStats::default();
     let training_start = Instant::now();
+    let mut hil_spike_episodes_remaining = 0usize;
+    let mut hil_paused = false;
+    let mut hil_ack_counter = 1u64;
+    let mut hil_lr_multiplier = 1.0f32;
+    let total_targets = manifest.targets.len();
 
-    for (target_idx, target) in manifest.targets.iter().enumerate() {
+    // Initialize learning monitor
+    let mut learning_monitor = LearningMonitor {
+        training_mode: "interleaved".to_string(),
+        ..Default::default()
+    };
+
+    // Initialize family performance tracking
+    for target in &manifest.targets {
+        learning_monitor.family_performance
+            .entry(target.family.clone())
+            .or_insert_with(FamilyStats::default)
+            .targets_count += 1;
+    }
+
+    // Create interleaved target order (zipper pattern across families)
+    let interleaved_order = interleave_targets_by_family(&manifest.targets);
+
+    // Log the interleaved training order
+    info!("🔀 INTERLEAVED TRAINING ORDER (zipper across families):");
+    let mut current_round = 0;
+    let num_families = learning_monitor.family_performance.len();
+    for (i, &idx) in interleaved_order.iter().enumerate() {
+        let target = &manifest.targets[idx];
+        let round = i / num_families;
+        if round != current_round {
+            current_round = round;
+            info!("   --- Round {} ---", round + 1);
+        }
+        info!("   {}: {} [{}]", i + 1, target.name, target.family);
+    }
+    info!("");
+    info!("💡 This interleaved order helps the network learn cross-family patterns");
+    info!("   by exposing it to diverse protein structures in rapid succession.");
+    info!("");
+
+    for (order_idx, &target_idx) in interleaved_order.iter().enumerate() {
+        let target = &manifest.targets[target_idx];
+        // Calculate interleave round
+        let interleave_round = order_idx / num_families;
+        learning_monitor.interleave_round = interleave_round;
+
         println!();
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("🎯 Target {}/{}: {}", target_idx + 1, manifest.targets.len(), target.name);
+        info!("🎯 Target {}/{}: {} (Interleave Round {})",
+              order_idx + 1, total_targets, target.name, interleave_round + 1);
         info!("   Family: {}, Difficulty: {}", target.family, target.difficulty);
         info!("   Target residues: {:?}", target.target_residues);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -184,6 +452,75 @@ fn main() -> Result<()> {
 
         for episode in 0..args.max_episodes {
             let episode_start = Instant::now();
+
+            // ================================================================
+            // HIL Control: Check for commands before each episode
+            // ================================================================
+            let hil_control = read_hil_control(&args.output);
+
+            // Handle pause command
+            if hil_control.pause && !hil_paused {
+                hil_paused = true;
+                warn!("⏸️  HIL: Training PAUSED. Set 'pause: false' in hil_control.json to resume.");
+            }
+
+            // Wait while paused
+            while hil_paused {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let ctrl = read_hil_control(&args.output);
+                if !ctrl.pause {
+                    hil_paused = false;
+                    info!("▶️  HIL: Training RESUMED");
+                }
+            }
+
+            // Handle spike_exploration command
+            if hil_control.spike_exploration > 0 {
+                hil_spike_episodes_remaining = hil_control.spike_exploration;
+                agent.set_epsilon(0.8f64);
+                warn!("🔥 HIL: SPIKE EXPLORATION activated for {} episodes (ε=0.8)", hil_spike_episodes_remaining);
+                ack_hil_control(&args.output, hil_ack_counter);
+                hil_ack_counter += 1;
+            }
+
+            // Handle set_epsilon command
+            if let Some(new_eps) = hil_control.set_epsilon {
+                let clamped = (new_eps as f64).clamp(0.0, 1.0);
+                agent.set_epsilon(clamped);
+                warn!("🎚️  HIL: Epsilon set to {:.3}", clamped);
+                ack_hil_control(&args.output, hil_ack_counter);
+                hil_ack_counter += 1;
+            }
+
+            // Handle save_checkpoint command
+            if hil_control.save_checkpoint {
+                let checkpoint_path = format!("{}/hil_checkpoint_{}_{}.json", args.output, target.name, episode);
+                agent.save(&checkpoint_path)?;
+                warn!("💾 HIL: Forced checkpoint saved: {}", checkpoint_path);
+                ack_hil_control(&args.output, hil_ack_counter);
+                hil_ack_counter += 1;
+            }
+
+            // Handle learning_rate_multiplier command
+            if let Some(lr_mult) = hil_control.learning_rate_multiplier {
+                let clamped = lr_mult.clamp(0.1, 10.0);
+                if (clamped - hil_lr_multiplier).abs() > 0.001 {
+                    hil_lr_multiplier = clamped;
+                    agent.set_learning_rate_multiplier(clamped);
+                    warn!("📈 HIL: Learning rate multiplier set to {:.2}x", clamped);
+                    ack_hil_control(&args.output, hil_ack_counter);
+                    hil_ack_counter += 1;
+                }
+            }
+
+            // Decay spike exploration counter
+            if hil_spike_episodes_remaining > 0 {
+                hil_spike_episodes_remaining -= 1;
+                if hil_spike_episodes_remaining == 0 {
+                    info!("🔥 HIL: Spike exploration ended, resuming normal decay");
+                }
+            }
+            // ================================================================
 
             // Run one episode with macro-step training
             let (episode_reward, transitions, steps) = run_macro_step_episode(
@@ -225,6 +562,63 @@ fn main() -> Result<()> {
 
             stats.total_episodes += 1;
 
+            // ================================================================
+            // HIL Status: Write status file for monitoring
+            // ================================================================
+            let total_time = training_start.elapsed().as_secs_f32();
+            let episodes_done = stats.total_episodes;
+            let episodes_remaining = (total_targets - target_idx - 1) * args.max_episodes
+                + (args.max_episodes - episode - 1);
+            let avg_episode_time = if episodes_done > 0 { total_time / episodes_done as f32 } else { 0.0 };
+            let eta_secs = episodes_remaining as f32 * avg_episode_time;
+
+            // Update learning monitor with recent data
+            learning_monitor.recent_rewards.push(episode_reward);
+            if learning_monitor.recent_rewards.len() > 20 {
+                learning_monitor.recent_rewards.remove(0);
+            }
+            learning_monitor.recent_errors.push(avg_error);
+            if learning_monitor.recent_errors.len() > 20 {
+                learning_monitor.recent_errors.remove(0);
+            }
+            learning_monitor.reward_trend = calculate_trend(&learning_monitor.recent_rewards);
+            learning_monitor.error_trend = calculate_trend(&learning_monitor.recent_errors);
+            learning_monitor.avg_episode_time = if stats.total_episodes > 0 {
+                total_time / stats.total_episodes as f32
+            } else {
+                0.0
+            };
+
+            // Update families in current round
+            learning_monitor.families_in_round = learning_monitor.family_performance
+                .keys().cloned().collect();
+            learning_monitor.families_in_round.sort();
+
+            let status = HilStatus {
+                current_target: target.name.clone(),
+                current_family: target.family.clone(),
+                target_idx: order_idx + 1,
+                total_targets,
+                episode,
+                max_episodes: args.max_episodes,
+                epsilon: agent.get_epsilon(),
+                episode_reward,
+                best_reward: best_episode_reward,
+                episodes_without_improvement,
+                patience: args.patience,
+                rls_error: avg_error,
+                episode_time_secs: episode_time.as_secs_f32(),
+                total_time_secs: total_time,
+                eta_secs,
+                paused: hil_paused,
+                learning_rate_multiplier: hil_lr_multiplier,
+                stats: stats.clone(),
+                learning_monitor: learning_monitor.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            write_hil_status(&args.output, &status);
+            // ================================================================
+
             // Early stopping on target reward
             if let Some(target_reward) = args.target_reward {
                 if best_episode_reward >= target_reward {
@@ -253,7 +647,25 @@ fn main() -> Result<()> {
             stats.best_reward = best_episode_reward;
         }
 
-        info!("✅ Target {} completed: best_reward={:+.3}", target.name, best_episode_reward);
+        // Update family performance
+        if let Some(family_stats) = learning_monitor.family_performance.get_mut(&target.family) {
+            family_stats.targets_completed += 1;
+            family_stats.sum_best_rewards += best_episode_reward;
+            family_stats.avg_best_reward = if family_stats.targets_completed > 0 {
+                family_stats.sum_best_rewards / family_stats.targets_completed as f32
+            } else {
+                0.0
+            };
+        }
+
+        info!("✅ Target {} [{}] completed: best_reward={:+.3}",
+              target.name, target.family, best_episode_reward);
+
+        // Log family progress
+        if let Some(fs) = learning_monitor.family_performance.get(&target.family) {
+            info!("   📊 Family '{}' progress: {}/{} targets, avg_reward={:+.4}",
+                  target.family, fs.targets_completed, fs.targets_count, fs.avg_best_reward);
+        }
 
         // Save per-target checkpoint
         let target_path = format!("{}/agent_after_{}.json", args.output, target.name);
